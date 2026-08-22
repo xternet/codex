@@ -34,6 +34,16 @@ impl ChatWidget {
             return;
         }
 
+        if self.bottom_pane.composer_wants_selection_input(key_event) {
+            self.bottom_pane.clear_quit_shortcut_hint();
+            self.quit_shortcut_expires_at = None;
+            self.quit_shortcut_key = None;
+            let had_popup = !self.bottom_pane.no_modal_or_popup_active();
+            let input_result = self.bottom_pane.handle_key_event(key_event);
+            self.handle_composer_input_result(input_result, had_popup);
+            return;
+        }
+
         if self.handle_reasoning_shortcut(key_event) {
             self.bottom_pane.clear_quit_shortcut_hint();
             self.quit_shortcut_expires_at = None;

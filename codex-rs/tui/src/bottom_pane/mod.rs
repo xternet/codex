@@ -880,6 +880,15 @@ impl BottomPane {
     }
 
     #[cfg(test)]
+    pub(crate) fn composer_selected_text(&self) -> Option<String> {
+        self.composer.selected_text()
+    }
+
+    pub(crate) fn composer_wants_selection_input(&self, key_event: KeyEvent) -> bool {
+        self.view_stack.is_empty() && self.composer.wants_selection_input(key_event)
+    }
+
+    #[cfg(test)]
     pub(crate) fn composer_cursor(&self) -> usize {
         self.composer.cursor()
     }
@@ -1382,6 +1391,7 @@ impl BottomPane {
             && self.is_task_running
             && !(is_agent_command && key_event.code == KeyCode::Esc)
             && self.no_modal_or_popup_active()
+            && !self.composer_wants_selection_input(key_event)
             && !self.composer_should_handle_vim_insert_escape(key_event)
             && self.status.is_some()
     }

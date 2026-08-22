@@ -148,6 +148,8 @@
 //! The burst detector can also be disabled (`disable_paste_burst`), which bypasses the state
 //! machine and treats the key stream as normal typing. When toggling from enabled → disabled, the
 //! composer flushes/clears any in-flight burst state so it cannot leak into subsequent input.
+//! An active text selection also bypasses burst detection so the next typed character replaces
+//! the selection immediately instead of waiting for the burst window to expire.
 //!
 //! For the detailed burst state machine, see `codex-rs/tui/src/bottom_pane/paste_burst.rs`.
 //!
@@ -434,6 +436,8 @@ pub(crate) struct ChatComposerConfig {
     pub(crate) slash_commands_enabled: bool,
     /// Whether pasting a file path can attach local images.
     pub(crate) image_paste_enabled: bool,
+    /// Whether this composer supports native text selection.
+    pub(crate) selection_enabled: bool,
 }
 
 impl Default for ChatComposerConfig {
@@ -442,6 +446,7 @@ impl Default for ChatComposerConfig {
             popups_enabled: true,
             slash_commands_enabled: true,
             image_paste_enabled: true,
+            selection_enabled: true,
         }
     }
 }
@@ -456,6 +461,7 @@ impl ChatComposerConfig {
             popups_enabled: false,
             slash_commands_enabled: false,
             image_paste_enabled: false,
+            selection_enabled: false,
         }
     }
 }
@@ -608,9 +614,13 @@ impl ChatComposer {
         let default_keymap = RuntimeKeymap::defaults();
         let default_editor_keymap = default_keymap.editor.clone();
         let default_vim_normal_keymap = default_keymap.vim_normal.clone();
+        let mut draft = DraftState::new();
+        draft
+            .textarea
+            .set_selection_enabled(config.selection_enabled);
 
         let mut this = Self {
-            draft: DraftState::new(),
+            draft,
             popups: PopupState::default(),
             app_event_tx,
             history: ChatComposerHistory::new(),
@@ -1135,10 +1145,14 @@ impl ChatComposer {
         let char_count = pasted.chars().count();
         if char_count > LARGE_PASTE_CHAR_THRESHOLD {
             let placeholder = self.next_large_paste_placeholder(char_count);
+            let elements_before = self.tracked_element_payloads();
             self.draft.textarea.insert_element(&placeholder);
             self.draft
                 .pending_pastes
                 .push((placeholder, pasted.into_owned()));
+            if let Some(elements_before) = elements_before {
+                self.reconcile_deleted_elements(elements_before);
+            }
         } else if char_count > 1
             && self.image_paste_enabled()
             && self.handle_paste_image_path(&pasted)
@@ -1682,6 +1696,17 @@ impl ChatComposer {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        self.draft.textarea.selected_text().map(str::to_owned)
+    }
+
+    pub(crate) fn wants_selection_input(&self, key_event: KeyEvent) -> bool {
+        self.draft.input_enabled
+            && self.history_search.is_none()
+            && self.draft.textarea.wants_selection_input(key_event)
+    }
+
     /// Rehydrate a history entry into the composer with shell-like cursor placement.
     ///
     /// This path restores text, elements, images, mention bindings, and pending paste payloads,
@@ -1758,8 +1783,12 @@ impl ChatComposer {
 
     /// Insert an attachment placeholder and track it for the next submission.
     pub fn attach_image(&mut self, path: PathBuf) {
+        let elements_before = self.tracked_element_payloads();
         self.attachments
             .attach_image(&mut self.draft.textarea, path);
+        if let Some(elements_before) = elements_before {
+            self.reconcile_deleted_elements(elements_before);
+        }
     }
 
     #[cfg(test)]
@@ -1885,8 +1914,12 @@ impl ChatComposer {
     }
 
     pub(crate) fn insert_str(&mut self, text: &str) {
+        let elements_before = self.tracked_element_payloads();
         self.draft.textarea.insert_str(text);
         self.sync_bash_mode_from_text();
+        if let Some(elements_before) = elements_before {
+            self.reconcile_deleted_elements(elements_before);
+        }
         self.sync_popups();
     }
 
@@ -1908,12 +1941,19 @@ impl ChatComposer {
             return self.begin_history_search();
         }
 
-        let result = match &mut self.popups.active {
-            ActivePopup::Command(_) => self.handle_key_event_with_slash_popup(key_event),
-            ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
-            ActivePopup::Skill(_) => self.handle_key_event_with_skill_popup(key_event),
-            ActivePopup::MentionV2(_) => self.handle_key_event_with_mentions_v2_popup(key_event),
-            ActivePopup::None => self.handle_key_event_without_popup(key_event),
+        let result = if self.wants_selection_input(key_event) {
+            self.attachments.clear_remote_image_selection();
+            self.handle_input_basic(key_event)
+        } else {
+            match &mut self.popups.active {
+                ActivePopup::Command(_) => self.handle_key_event_with_slash_popup(key_event),
+                ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
+                ActivePopup::Skill(_) => self.handle_key_event_with_skill_popup(key_event),
+                ActivePopup::MentionV2(_) => {
+                    self.handle_key_event_with_mentions_v2_popup(key_event)
+                }
+                ActivePopup::None => self.handle_key_event_without_popup(key_event),
+            }
         };
         self.reset_vim_mode_after_successful_dispatch(&result.0);
         // Update (or hide/show) popup after processing the key.
@@ -3303,8 +3343,13 @@ impl ChatComposer {
         &mut self,
         key_event: &KeyEvent,
     ) -> Option<(InputResult, bool)> {
-        self.attachments
-            .handle_remote_image_selection_key(key_event, &mut self.draft.textarea)
+        let handled = self
+            .attachments
+            .handle_remote_image_selection_key(key_event, &mut self.draft.textarea);
+        if handled.is_some() {
+            self.draft.textarea.clear_selection();
+        }
+        handled
     }
 
     /// Handle key event when no popup is visible.
@@ -3420,9 +3465,11 @@ impl ChatComposer {
             )
         };
         if history_up_pressed || history_down_pressed {
-            if self
-                .history
-                .should_handle_navigation(&self.current_text(), self.history_navigation_cursor())
+            if self.draft.textarea.selection_range().is_none()
+                && self.history.should_handle_navigation(
+                    &self.current_text(),
+                    self.history_navigation_cursor(),
+                )
             {
                 let replace_entry = if history_up_pressed {
                     self.history.navigate_up(&self.app_event_tx)
@@ -3596,12 +3643,7 @@ impl ChatComposer {
         // For non-char inputs (or after flushing), handle normally.
         // Track element removals so we can drop any corresponding placeholders without scanning
         // the full text. (Placeholders are atomic elements; when deleted, the element disappears.)
-        let elements_before = if self.draft.pending_pastes.is_empty() && self.attachments.is_empty()
-        {
-            None
-        } else {
-            Some(self.draft.textarea.element_payloads())
-        };
+        let elements_before = self.tracked_element_payloads();
 
         if self.draft.is_bash_mode
             && matches!(input.code, KeyCode::Backspace)
@@ -3645,6 +3687,14 @@ impl ChatComposer {
         if !self.draft.is_bash_mode && self.draft.textarea.text().starts_with('!') {
             self.draft.textarea.replace_range(0..1, "");
             self.draft.is_bash_mode = true;
+        }
+    }
+
+    fn tracked_element_payloads(&self) -> Option<Vec<String>> {
+        if self.draft.pending_pastes.is_empty() && self.attachments.is_empty() {
+            None
+        } else {
+            Some(self.draft.textarea.element_payloads())
         }
     }
 
@@ -4198,8 +4248,11 @@ impl ChatComposer {
         self.draft.input_disabled_placeholder = if enabled { None } else { placeholder };
 
         // Avoid leaving interactive popups open while input is blocked.
-        if !enabled && self.popups.active() {
-            self.popups.active = ActivePopup::None;
+        if !enabled {
+            self.draft.textarea.clear_selection();
+            if self.popups.active() {
+                self.popups.active = ActivePopup::None;
+            }
         }
     }
 

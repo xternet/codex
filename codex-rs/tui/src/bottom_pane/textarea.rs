@@ -41,8 +41,11 @@ use std::cell::RefCell;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
+mod selection;
 mod vim;
 mod wrapping;
+use self::selection::SelectionMotion;
+use self::selection::TextSelection;
 use self::vim::VimMode;
 use self::vim::VimMotion;
 use self::vim::VimOperator;
@@ -118,6 +121,7 @@ pub(crate) struct TextElementSnapshot {
 pub(crate) struct TextArea {
     text: String,
     cursor_pos: usize,
+    selection: TextSelection,
     wrap_cache: RefCell<Option<WrapCache>>,
     preferred_col: Option<usize>,
     elements: Vec<TextElement>,
@@ -159,6 +163,7 @@ impl TextArea {
         Self {
             text: String::new(),
             cursor_pos: 0,
+            selection: TextSelection::default(),
             wrap_cache: RefCell::new(None),
             preferred_col: None,
             elements: Vec::new(),
@@ -234,6 +239,7 @@ impl TextArea {
         // The kill buffer is editing history rather than visible-buffer state, so full-buffer
         // replacements intentionally leave it alone.
         self.cursor_pos = self.clamp_pos_to_nearest_boundary(self.cursor_pos);
+        self.selection.clear();
         self.wrap_cache.replace(None);
         self.preferred_col = None;
     }
@@ -245,6 +251,7 @@ impl TextArea {
     /// toggle cannot leave the next keypress interpreted as the second half of
     /// an old `d` or `y` command.
     pub(crate) fn set_vim_enabled(&mut self, enabled: bool) {
+        self.selection.clear();
         self.vim_enabled = enabled;
         self.vim_pending = VimPending::None;
         self.vim_mode = if enabled {
@@ -317,6 +324,7 @@ impl TextArea {
     /// stale visual target.
     pub(crate) fn enter_vim_normal_mode(&mut self) {
         if self.vim_enabled {
+            self.selection.clear();
             self.vim_mode = VimMode::Normal;
             self.vim_pending = VimPending::None;
             self.preferred_col = None;
@@ -325,11 +333,12 @@ impl TextArea {
 
     /// Return whether rapid plain-key bursts should be treated as paste input.
     ///
-    /// Paste burst detection is disabled in Vim normal mode so a fast sequence
-    /// like `dd` or `yw` remains command input instead of being converted into
-    /// literal text.
+    /// Paste burst detection is disabled while text is selected so the next
+    /// typed character replaces the selection immediately. It is also disabled
+    /// in Vim normal mode so a fast sequence like `dd` or `yw` remains command
+    /// input instead of being converted into literal text.
     pub(crate) fn allows_paste_burst(&self) -> bool {
-        !self.vim_enabled || self.vim_mode == VimMode::Insert
+        self.selection_range().is_none() && (!self.vim_enabled || self.vim_mode == VimMode::Insert)
     }
 
     /// Return whether rendering should use the insert-mode cursor style.
@@ -369,11 +378,67 @@ impl TextArea {
         &self.text
     }
 
+    pub(crate) fn set_selection_enabled(&mut self, enabled: bool) {
+        self.selection.set_enabled(enabled);
+    }
+
+    pub(crate) fn selection_range(&self) -> Option<Range<usize>> {
+        self.selection.range(self.cursor_pos)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_text(&self) -> Option<&str> {
+        self.selection_range()
+            .and_then(|range| self.text.get(range))
+    }
+
+    pub(crate) fn clear_selection(&mut self) {
+        self.selection.clear();
+    }
+
+    pub(crate) fn wants_selection_input(&self, event: KeyEvent) -> bool {
+        if self.vim_enabled && self.vim_mode == VimMode::Normal {
+            return false;
+        }
+        if self.should_clear_selection(event) {
+            return true;
+        }
+        // Keep shifted movement editor-owned for any nonempty draft, even at a boundary, so the
+        // same key cannot become a chat action solely because the cursor reached an endpoint.
+        !self.text.is_empty()
+            && self
+                .selection
+                .motion_for_event(event, &self.editor_keymap)
+                .is_some()
+    }
+
+    fn should_clear_selection(&self, event: KeyEvent) -> bool {
+        self.selection_range().is_some()
+            && event.code == KeyCode::Esc
+            && event.modifiers == KeyModifiers::NONE
+            && matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+    }
+
+    pub(crate) fn delete_selection(&mut self) -> bool {
+        let Some(range) = self.selection_range() else {
+            return false;
+        };
+        let range = self.expand_range_to_element_boundaries(range);
+        self.replace_range_raw(range, "");
+        true
+    }
+
     pub fn insert_str(&mut self, text: &str) {
-        self.insert_str_at(self.cursor_pos, text);
+        if let Some(range) = self.selection_range() {
+            let range = self.expand_range_to_element_boundaries(range);
+            self.replace_range_raw(range, text);
+        } else {
+            self.insert_str_at(self.cursor_pos, text);
+        }
     }
 
     pub fn insert_str_at(&mut self, pos: usize, text: &str) {
+        self.selection.clear();
         let pos = self.clamp_pos_for_insertion(pos);
         self.text.insert_str(pos, text);
         self.wrap_cache.replace(None);
@@ -391,6 +456,7 @@ impl TextArea {
 
     fn replace_range_raw(&mut self, range: std::ops::Range<usize>, text: &str) {
         assert!(range.start <= range.end);
+        self.selection.clear();
         let start = range.start.clamp(0, self.text.len());
         let end = range.end.clamp(0, self.text.len());
         let removed_len = end - start;
@@ -427,6 +493,7 @@ impl TextArea {
     }
 
     pub fn set_cursor(&mut self, pos: usize) {
+        self.selection.clear();
         self.cursor_pos = pos.clamp(0, self.text.len());
         self.cursor_pos = self.clamp_pos_to_nearest_boundary(self.cursor_pos);
         self.preferred_col = None;
@@ -539,6 +606,15 @@ impl TextArea {
     }
 
     pub fn input_with_keymap(&mut self, event: KeyEvent, keymap: &EditorKeymap) {
+        if self.should_clear_selection(event) {
+            self.selection.clear();
+            return;
+        }
+        if let Some(motion) = self.selection.motion_for_event(event, keymap) {
+            self.extend_selection(motion);
+            return;
+        }
+
         if keymap.insert_newline.is_pressed(event) {
             self.insert_str("\n");
             return;
@@ -591,30 +667,45 @@ impl TextArea {
             return;
         }
         if keymap.move_word_left.is_pressed(event) {
+            if self.collapse_selection_to_start() {
+                return;
+            }
             self.set_cursor(self.beginning_of_previous_word());
             return;
         }
         if keymap.move_word_right.is_pressed(event) {
+            if self.collapse_selection_to_end() {
+                return;
+            }
             self.set_cursor(self.end_of_next_word());
             return;
         }
         if keymap.move_left.is_pressed(event) {
+            if self.collapse_selection_to_start() {
+                return;
+            }
             self.move_cursor_left();
             return;
         }
         if keymap.move_right.is_pressed(event) {
+            if self.collapse_selection_to_end() {
+                return;
+            }
             self.move_cursor_right();
             return;
         }
         if keymap.move_up.is_pressed(event) {
+            self.selection.clear();
             self.move_cursor_up();
             return;
         }
         if keymap.move_down.is_pressed(event) {
+            self.selection.clear();
             self.move_cursor_down();
             return;
         }
         if keymap.move_line_start.is_pressed(event) {
+            self.selection.clear();
             let move_up_at_bol = matches!(
                 event,
                 KeyEvent {
@@ -627,6 +718,7 @@ impl TextArea {
             return;
         }
         if keymap.move_line_end.is_pressed(event) {
+            self.selection.clear();
             let move_down_at_eol = matches!(
                 event,
                 KeyEvent {
@@ -1002,7 +1094,10 @@ impl TextArea {
 
     // ####### Input Functions #######
     pub fn delete_backward(&mut self, n: usize) {
-        if n == 0 || self.cursor_pos == 0 {
+        if n == 0 {
+            return;
+        }
+        if self.delete_selection() || self.cursor_pos == 0 {
             return;
         }
         let mut target = self.cursor_pos;
@@ -1016,7 +1111,10 @@ impl TextArea {
     }
 
     pub fn delete_forward(&mut self, n: usize) {
-        if n == 0 || self.cursor_pos >= self.text.len() {
+        if n == 0 {
+            return;
+        }
+        if self.delete_selection() || self.cursor_pos >= self.text.len() {
             return;
         }
         let mut target = self.cursor_pos;
@@ -1030,7 +1128,10 @@ impl TextArea {
     }
 
     pub fn delete_forward_kill(&mut self, n: usize) {
-        if n == 0 || self.cursor_pos >= self.text.len() {
+        if n == 0 {
+            return;
+        }
+        if self.kill_selection() || self.cursor_pos >= self.text.len() {
             return;
         }
         let mut target = self.cursor_pos;
@@ -1044,6 +1145,9 @@ impl TextArea {
     }
 
     pub fn delete_backward_word(&mut self) {
+        if self.kill_selection() {
+            return;
+        }
         let start = self.beginning_of_previous_word();
         self.kill_range(start..self.cursor_pos);
     }
@@ -1054,6 +1158,9 @@ impl TextArea {
     /// by `end_of_next_word()`. Any whitespace (including newlines) between the cursor and that
     /// word is included in the deletion.
     pub fn delete_forward_word(&mut self) {
+        if self.kill_selection() {
+            return;
+        }
         let end = self.end_of_next_word();
         if end > self.cursor_pos {
             self.kill_range(self.cursor_pos..end);
@@ -1067,6 +1174,9 @@ impl TextArea {
     /// yank target and remains available even if a caller later clears or rewrites the visible
     /// buffer via `set_text_*`.
     pub fn kill_to_end_of_line(&mut self) {
+        if self.kill_selection() {
+            return;
+        }
         let eol = self.end_of_current_line();
         let range = if self.cursor_pos == eol {
             if eol < self.text.len() {
@@ -1091,6 +1201,9 @@ impl TextArea {
     }
 
     pub fn kill_to_beginning_of_line(&mut self) {
+        if self.kill_selection() {
+            return;
+        }
         let bol = self.beginning_of_current_line();
         let range = if self.cursor_pos == bol {
             if bol > 0 { Some(bol - 1..bol) } else { None }
@@ -1118,6 +1231,14 @@ impl TextArea {
 
     fn kill_range(&mut self, range: Range<usize>) {
         self.kill_range_with_kind(range, KillBufferKind::Characterwise);
+    }
+
+    fn kill_selection(&mut self) -> bool {
+        let Some(range) = self.selection_range() else {
+            return false;
+        };
+        self.kill_range(range);
+        true
     }
 
     fn kill_line_range(&mut self, range: Range<usize>) {
@@ -1205,6 +1326,9 @@ impl TextArea {
     }
 
     fn kill_current_line(&mut self) {
+        if self.kill_selection() {
+            return;
+        }
         let range = self.current_line_range_with_newline();
         self.kill_line_range(range);
     }
@@ -1214,6 +1338,42 @@ impl TextArea {
         let eol = self.end_of_current_line();
         let end = if eol < self.text.len() { eol + 1 } else { eol };
         bol..end
+    }
+
+    fn extend_selection(&mut self, motion: SelectionMotion) {
+        let anchor = self.selection.anchor().unwrap_or(self.cursor_pos);
+        self.selection.clear();
+        match motion {
+            SelectionMotion::Left => self.move_cursor_left(),
+            SelectionMotion::Right => self.move_cursor_right(),
+            SelectionMotion::Up => self.move_cursor_up(),
+            SelectionMotion::Down => self.move_cursor_down(),
+            SelectionMotion::WordLeft => self.set_cursor(self.beginning_of_previous_word()),
+            SelectionMotion::WordRight => self.set_cursor(self.end_of_next_word()),
+            SelectionMotion::LineStart => {
+                self.move_cursor_to_beginning_of_line(/*move_up_at_bol*/ false);
+            }
+            SelectionMotion::LineEnd => {
+                self.move_cursor_to_end_of_line(/*move_down_at_eol*/ false);
+            }
+        }
+        self.selection.finish_motion(anchor, self.cursor_pos);
+    }
+
+    fn collapse_selection_to_start(&mut self) -> bool {
+        let Some(range) = self.selection_range() else {
+            return false;
+        };
+        self.set_cursor(range.start);
+        true
+    }
+
+    fn collapse_selection_to_end(&mut self) -> bool {
+        let Some(range) = self.selection_range() else {
+            return false;
+        };
+        self.set_cursor(range.end);
+        true
     }
 
     /// Move the cursor left by a single grapheme cluster.
@@ -1468,6 +1628,7 @@ impl TextArea {
         else {
             return false;
         };
+        self.selection.clear();
 
         let range = self.elements[idx].range.clone();
         let start = range.start;
@@ -1526,9 +1687,9 @@ impl TextArea {
     }
 
     pub fn insert_element(&mut self, text: &str) -> u64 {
-        let start = self.clamp_pos_for_insertion(self.cursor_pos);
-        self.insert_str_at(start, text);
-        let end = start + text.len();
+        self.insert_str(text);
+        let end = self.cursor_pos;
+        let start = end.saturating_sub(text.len());
         let id = self.add_element(start..end);
         // Place cursor at end of inserted element
         self.set_cursor(end);
@@ -1566,6 +1727,7 @@ impl TextArea {
         {
             return None;
         }
+        self.selection.clear();
         let id = self.add_element(start..end);
         Some(id)
     }
@@ -2067,6 +2229,8 @@ impl TextArea {
                     *style,
                 );
             }
+
+            self.render_selection_for_line(area, buf, y, r, line_range);
         }
     }
 
@@ -2094,9 +2258,50 @@ impl TextArea {
                 usize::from(area.width),
                 Style::default(),
             );
+            self.render_selection_for_line(area, buf, y, r, line_range);
+        }
+    }
+
+    fn render_selection_for_line(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        y: u16,
+        wrapped_range: &Range<usize>,
+        line_range: Range<usize>,
+    ) {
+        let Some(selection) = self.selection_range() else {
+            return;
+        };
+        let selection_style = Style::default().add_modifier(ratatui::style::Modifier::REVERSED);
+        let overlap_start = selection.start.max(line_range.start);
+        let overlap_end = selection.end.min(line_range.end);
+        if overlap_start < overlap_end {
+            let prefix = text_for_display(&self.text[line_range.start..overlap_start]);
+            let selected = text_for_display(&self.text[overlap_start..overlap_end]);
+            let x_offset = display_width(prefix.as_ref()) as u16;
+            let width = display_width(selected.as_ref())
+                .min(usize::from(area.width.saturating_sub(x_offset)))
+                as u16;
+            if width > 0 {
+                buf.set_style(Rect::new(area.x + x_offset, y, width, 1), selection_style);
+            }
+        }
+
+        let newline = wrapped_range.end.saturating_sub(1);
+        if self.text.as_bytes().get(newline) == Some(&b'\n') && selection.contains(&newline) {
+            let displayed = text_for_display(&self.text[line_range]);
+            let x_offset = display_width(displayed.as_ref()) as u16;
+            if x_offset < area.width {
+                buf.set_style(Rect::new(area.x + x_offset, y, 1, 1), selection_style);
+            }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "textarea_selection_tests.rs"]
+mod selection_tests;
 
 #[cfg(test)]
 mod tests {
